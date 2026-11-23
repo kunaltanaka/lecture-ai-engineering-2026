@@ -54,3 +54,47 @@ def test_existing_index_survives_failed_rebuild(materials):
         build_index(source, database, rebuild=True, embedder=embed)
     assert database.read_bytes() == before
     assert not list(database.parent.glob(".rag-build-*"))
+
+
+def test_search_expands_adjacent_pages_without_duplicates(tmp_path, monkeypatch):
+    source = tmp_path / "lectures.json"
+    source.write_text(json.dumps([
+        {"id": "lec01-main", "title": "講義1", "content": [
+            {"section": "章", "content": [
+                {"id": f"lec01-main-p00{p}", "title": f"p{p}", "page": p, "content": f"講義1の本文{p}"}
+                for p in (1, 2, 3, 4)
+            ]}]},
+        {"id": "lec02-main", "title": "講義2", "content": [
+            {"section": "章", "content": [
+                {"id": "lec02-main-p001", "title": "p1", "page": 1, "content": "講義2の本文1"},
+                {"id": "lec02-main-p002", "title": "p2", "page": 2, "content": "講義2の本文2"},
+            ]}]},
+    ], ensure_ascii=False), encoding="utf-8")
+    database = tmp_path / "index.sqlite3"
+
+    def embed(text, task):
+        if "講義1の本文2" in text:
+            return [1.0, 0.0]
+        if "講義1の本文3" in text:
+            return [0.9, 0.43589]
+        return [0.0, 1.0]
+
+    build_index(source, database, embedder=embed)
+    monkeypatch.setattr(retrieval, "RAG_SOURCE", source)
+    monkeypatch.setattr(retrieval, "RAG_DB", database)
+    monkeypatch.setattr(retrieval, "RAG_TOP_K", 2)
+    monkeypatch.setattr(retrieval, "embed_text", lambda *_: [1.0, 0.0])
+
+    # ヒットは lec01 p2, p3 → 前後1ページ展開で p1, p2, p3, p4（重複なし・講義2は混ざらない）
+    hits = retrieval.search("質問")
+    assert [h["page_id"] for h in hits] == [
+        "lec01-main-p001", "lec01-main-p002", "lec01-main-p003", "lec01-main-p004",
+    ]
+    assert hits[0]["neighbor_of"] == "lec01-main-p002"
+    assert hits[1]["distance"] == pytest.approx(0.0)
+    assert "distance" in hits[2] and "neighbor_of" not in hits[2]
+    assert hits[3]["neighbor_of"] == "lec01-main-p003"
+
+    # neighbor_window=0 なら元のベクトル検索結果のみ
+    raw = retrieval.search("質問", neighbor_window=0)
+    assert [h["page_id"] for h in raw] == ["lec01-main-p002", "lec01-main-p003"]
